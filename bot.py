@@ -1,77 +1,87 @@
 import os
 import asyncio
 import aiohttp
-import random
 import logging
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BufferedInputFile
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.types import Message, BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 
-# Настройка логов, чтобы видеть ошибки в консоли Render
 logging.basicConfig(level=logging.INFO)
 
-# Получаем ключи из переменных окружения (Environment Variables)
+# КЛЮЧИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
-MODEL_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Проверка ключей перед запуском
-if not TOKEN or not HF_TOKEN:
-    print("❌ ОШИБКА: Забыли прописать TELEGRAM_TOKEN или HF_TOKEN в настройках!")
-    exit(1)
+# URL-адреса API
+FLUX_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GOOGLE_API_KEY}"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-async def get_image(prompt: str):
-    """Функция запроса к нейронке Flux через Hugging Face"""
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {"seed": random.randint(0, 1000000)}
-    }
-    
+# Простейшее хранилище состояний (в памяти)
+user_modes = {} # {user_id: "image" или "chat"}
+
+def get_keyboard():
+    buttons = [
+        [KeyboardButton(text="🖼 Генерация картинок"), KeyboardButton(text="🤖 Чат с Gemini")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+async def call_gemini(text):
+    payload = {"contents": [{"parts": [{"text": text}]}]}
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(MODEL_URL, headers=headers, json=payload, timeout=60) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                elif resp.status == 503:
-                    return "busy"
-                else:
-                    error_text = await resp.text()
-                    logging.error(f"HF Error: {resp.status} - {error_text}")
-                    return None
-        except Exception as e:
-            logging.error(f"Request error: {e}")
+        async with session.post(GEMINI_URL, json=payload) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data['candidates'][0]['content']['parts'][0]['text']
+            return "❌ Ошибка Gemini. Проверь API ключ."
+
+async def call_flux(prompt):
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(FLUX_URL, headers=headers, json={"inputs": prompt}, timeout=60) as resp:
+            if resp.status == 200: return await resp.read()
+            if resp.status == 503: return "busy"
             return None
 
 @dp.message(Command("start"))
-async def start_cmd(message: Message):
-    await message.answer("Приуэт! Я твой личный генератор картинок на базе Flux.1.\n\nПросто напиши мне, что нарисовать (лучше на английском)!")
+async def start(message: Message):
+    user_modes[message.from_user.id] = "chat"
+    await message.answer("Здарова! Я обновился. Выбери режим на кнопках ниже:", reply_markup=get_keyboard())
+
+@dp.message(F.text == "🖼 Генерация картинок")
+async def set_mode_img(message: Message):
+    user_modes[message.from_user.id] = "image"
+    await message.answer("Режим переключен на ГЕНЕРАЦИЮ. Пиши промпт!")
+
+@dp.message(F.text == "🤖 Чат с Gemini")
+async def set_mode_chat(message: Message):
+    user_modes[message.from_user.id] = "chat"
+    await message.answer("Режим переключен на ЧАТ. Спрашивай что угодно!")
 
 @dp.message(F.text)
-async def handle_text(message: Message):
-    # Уведомляем юзера, что процесс пошел
-    status_msg = await message.answer("🎨 Малюю... Это займет секунд 10-15.")
+async def handle_all(message: Message):
+    mode = user_modes.get(message.from_user.id, "chat")
     
-    image_data = await get_image(message.text)
-    
-    if image_data == "busy":
-        await status_msg.edit_text("⏳ Сервера Hugging Face сейчас заняты (ошибка 503). Попробуй еще раз через минуту!")
-    elif image_data:
-        try:
-            photo = BufferedInputFile(image_data, filename="result.jpg")
-            await message.answer_photo(photo=photo, caption=f"Твой запрос: {message.text[:100]}")
-            await status_msg.delete()
-        except Exception as e:
-            logging.error(f"Send photo error: {e}")
-            await status_msg.edit_text("❌ Ошибка при отправке фото в Telegram.")
-    else:
-        await status_msg.edit_text("❌ Не удалось сгенерировать. Попробуй изменить промпт или подождать.")
+    if mode == "image":
+        status = await message.answer("🎨 Рисую...")
+        img = await call_flux(message.text)
+        if img == "busy":
+            await status.edit_text("⏳ Сервер занят, попробуй через минуту.")
+        elif img:
+            await message.answer_photo(BufferedInputFile(img, filename="pic.jpg"))
+            await status.delete()
+        else:
+            await status.edit_text("❌ Ошибка генерации.")
+            
+    else: # Режим ЧАТА
+        status = await message.answer("🤔 Думаю...")
+        response = await call_gemini(message.text)
+        await status.edit_text(response)
 
 async def main():
-    logging.info("Бот запускается...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
