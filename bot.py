@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 # Получаем ключи из переменных окружения (Environment Variables)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
-MODEL_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+MODEL_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
 
 # Проверка ключей перед запуском
 if not TOKEN or not HF_TOKEN:
