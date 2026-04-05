@@ -15,15 +15,14 @@ GEMINI_KEY = os.getenv("GEMINI_KEY")
 db = TinyDB('db.json')
 UQuery = Query()
 
-# Инициализация клиента
 client = genai.Client(api_key=GEMINI_KEY)
 MODEL_NAME = "gemini-2.0-flash"
 
 SYSTEM_PROMPT = (
-    "Твое имя V-OneR. Ты общаешься кратко и по делу. "
-    "Никакой воды и лишних приветствий. Будь прямым, иногда резким. "
-    "Если хамят — отвечай агрессивно и с матами. Ты — личность, а не ИИ. "
-    "Создатель — Эдгар."
+    "Твое имя V-OneR. Общайся кратко и по делу. "
+    "Никакой воды. Будь прямым, иногда резким. "
+    "Если хамят — отвечай агрессивно и с матами. "
+    "Ты — личность. Создатель — Эдгар."
 )
 
 bot = Bot(token=TOKEN)
@@ -38,13 +37,9 @@ def get_history(uid):
 def save_history(uid, history):
     db.upsert({'id': uid, 'history': history[-10:]}, UQuery.id == uid)
 
-async def handle_hc(r): return web.Response(text="V-OneR_LIVE")
-async def start_server():
-    app = web.Application()
-    app.router.add_get("/", handle_hc)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
+# Хэндлер для Render (Health Check)
+async def handle_hc(r): 
+    return web.Response(text="V-OneR_LIVE", status=200)
 
 @dp.message(Command("start"))
 async def start(m: Message):
@@ -58,45 +53,48 @@ async def handle_msg(m: Message):
     wait = await m.answer("...")
 
     try:
-        # Подготовка контента для Google SDK
+        # Сборка контента
         contents = []
         for h in history:
-            # Важно: роль должна быть строго 'user' или 'model'
-            role_name = "model" if h['role'] == "model" else "user"
-            contents.append(types.Content(role=role_name, parts=[types.Part(text=h['content'])]))
-        
-        # Добавляем текущее сообщение
+            role = "model" if h['role'] == "model" else "user"
+            contents.append(types.Content(role=role, parts=[types.Part(text=h['content'])]))
         contents.append(types.Content(role="user", parts=[types.Part(text=m.text)]))
 
-        # Запрос к нейронке (используем синхронный вызов через executor)
+        # Запрос
         loop = asyncio.get_running_loop()
-        def call_gemini():
-            return client.models.generate_content(
-                model=MODEL_NAME,
-                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-                contents=contents
-            )
-
-        response = await loop.run_in_executor(None, call_gemini)
+        response = await loop.run_in_executor(None, lambda: client.models.generate_content(
+            model=MODEL_NAME,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+            contents=contents
+        ))
+        
         answer = response.text
-
-        # Сохраняем в историю
         history.append({"role": "user", "content": m.text})
         history.append({"role": "model", "content": answer})
         save_history(uid, history)
-
         await wait.edit_text(answer)
 
     except Exception as e:
-        # ВЫВОДИМ РЕАЛЬНУЮ ОШИБКУ, ЧТОБЫ ПОНЯТЬ В ЧЕМ ДЕЛО
-        error_text = str(e)
-        logging.error(f"ПОЛНАЯ ОШИБКА: {error_text}")
-        await wait.edit_text(f"Трабл: {error_text[:200]}")
+        logging.error(f"Error: {e}")
+        await wait.edit_text(f"Трабл: {str(e)[:150]}")
 
 async def main():
-    asyncio.create_task(start_server())
-    logging.info("V-OneR READY")
+    # 1. Сначала запускаем веб-сервер, чтобы Render успокоился
+    app = web.Application()
+    app.router.add_get("/", handle_hc)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"SERVER STARTED ON PORT {port}")
+
+    # 2. Теперь запускаем бота
+    logging.info("V-OneR STARTING POLLING")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
