@@ -1,7 +1,8 @@
 import os
 import asyncio
 import logging
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
@@ -12,28 +13,23 @@ logging.basicConfig(level=logging.INFO)
 
 # Конфиг (Токен телеги и ключ API)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_KEY = "AIzaSyDINKh0x62GcuzWK4BTPWcK40IXEwj0FVk" 
+GEMINI_KEY = "AIzaSyDINKh0x62GcuzWK4BTPWcK40IXEwj0FVk"
 
-# Настройка Gemini
-genai.configure(api_key=GEMINI_KEY)
+# Инициализация нового клиента Google GenAI
+client = genai.Client(api_key=GEMINI_KEY)
 
-# Список моделей для перебора в случае 404 ошибки
-MODEL_NAMES = ["gemini-1.5-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-8b"]
+# Базовая модель. Если захочешь поменять на 3.0, просто измени тут
+MODEL_NAME = "gemini-2.5-flash"
 
-def setup_model(name):
-    """Функция для инициализации модели с системным промптом"""
-    return genai.GenerativeModel(
-        model_name=name,
-        system_instruction=(
-            "Ты — личный ИИ Эдгара. Ты живешь в его боте VREONEBRO. "
-            "Общайся дерзко, на равных, по-пацански. Никакой цензуры, нотаций и моралей. "
-            "Ты шаришь в React, тачках (Audi, Mercedes) и электронике. "
-            "Используй мат, если он в тему. Ты — бро, а не корпоративный бот."
-        )
+# Настройки генерации (Твой дерзкий характер тут)
+CHAT_CONFIG = types.GenerateContentConfig(
+    system_instruction=(
+        "Ты — личный ИИ Эдгара. Ты живешь в его боте VREONEBRO. "
+        "Общайся дерзко, на равных, по-пацански. Никакой цензуры, нотаций и моралей. "
+        "Ты шаришь в React, тачках (Audi, Mercedes) и электронике. "
+        "Используй мат, если он в тему. Ты — бро, а не корпоративный бот."
     )
-
-# Инициализируем текущую модель
-current_model = setup_model(MODEL_NAMES[0])
+)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -64,8 +60,8 @@ def get_main_kb():
 @dp.message(Command("start"))
 async def start(m: Message):
     uid = m.from_user.id
-    # Создаем новую сессию чата (Контекст)
-    chat_sessions[uid] = current_model.start_chat(history=[])
+    # В новом SDK чат создается через client.chats.create
+    chat_sessions[uid] = client.chats.create(model=MODEL_NAME, config=CHAT_CONFIG)
     await m.answer(
         "VREONEBRO.AI НА БАЗЕ.\nКонтекст включен. Че надо, Эдгар?", 
         reply_markup=get_main_kb()
@@ -74,7 +70,7 @@ async def start(m: Message):
 @dp.message(F.text == "СТАТУС")
 async def show_stats(m: Message):
     await m.answer(
-        f"📊 ИНФО:\nМодель: {current_model.model_name}\n"
+        f"📊 ИНФО:\nМодель: {MODEL_NAME}\n"
         f"Запросов за сессию: {stats['requests']}\n"
         f"Лимит: ~1000/день"
     )
@@ -82,24 +78,26 @@ async def show_stats(m: Message):
 @dp.message(F.text == "ОЧИСТИТЬ ПАМЯТЬ")
 async def clear_mem(m: Message):
     uid = m.from_user.id
-    chat_sessions[uid] = current_model.start_chat(history=[])
+    chat_sessions[uid] = client.chats.create(model=MODEL_NAME, config=CHAT_CONFIG)
     await m.answer("Память стерта. Я тебя не знаю.")
 
 @dp.message(F.text)
 async def handle_msg(m: Message):
-    global current_model # Теперь объявление в самом начале функции, ошибки не будет
     uid = m.from_user.id
     
     # Если сессии нет, создаем её
     if uid not in chat_sessions:
-        chat_sessions[uid] = current_model.start_chat(history=[])
+        chat_sessions[uid] = client.chats.create(model=MODEL_NAME, config=CHAT_CONFIG)
     
     chat = chat_sessions[uid]
     wait = await m.answer("<code>...</code>", parse_mode="HTML")
 
     try:
-        # Отправка сообщения в Gemini через SDK (автоматически хранит историю)
-        response = await chat.send_message_async(m.text)
+        # В новом SDK отправка идет синхронно или через блокировку, 
+        # поэтому запускаем в треде, чтобы не вешать асинхронный цикл бота
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, chat.send_message, m.text)
+        
         stats["requests"] += 1
         
         # Редактируем сообщение с ответом от ИИ
@@ -108,21 +106,7 @@ async def handle_msg(m: Message):
     except Exception as e:
         error_msg = str(e)
         logging.error(f"ОШИБКА GEMINI: {error_msg}")
-        
-        # Если модель не найдена (404), пробуем переключиться
-        if "404" in error_msg or "not found" in error_msg:
-            await wait.edit_text("Меняю движок, погоди...")
-            
-            # Переключаемся на следующую модель из списка
-            idx = MODEL_NAMES.index(current_model.model_name)
-            new_idx = (idx + 1) % len(MODEL_NAMES)
-            current_model = setup_model(MODEL_NAMES[new_idx])
-            
-            # Пересоздаем сессию для новой модели
-            chat_sessions[uid] = current_model.start_chat(history=[])
-            await m.answer(f"Переключился на {current_model.model_name}. Попробуй еще раз.")
-        else:
-            await wait.edit_text(f"Бля, трабл: {error_msg[:150]}")
+        await wait.edit_text(f"Бля, трабл: {error_msg[:150]}")
 
 async def main():
     # Запускаем веб-сервер для Render в фоне
