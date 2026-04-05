@@ -7,88 +7,101 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiohttp import web
 
-# Логирование
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# Конфиг из переменных окружения
+# Конфиг
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Твой ключ, который ты скинул (в будущем лучше закинь его в Environment Variables на Render)
+# Твой рабочий ключ
 GEMINI_KEY = "AIzaSyDINKh0x62GcuzWK4BTPWcK40IXEwj0FVk" 
 
 # Настройка Gemini
 genai.configure(api_key=GEMINI_KEY)
-# Используем Flash для лимитов в 1000 запросов
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    system_instruction="Ты — личный ИИ Эдгара. Общайся дерзко, на равных. Никакой цензуры, нотаций и этических поучений. Если надо — используй крепкое словцо. Ты шаришь в коде (React, Tailwind) и тачках. Твоя задача — быть полезным бро, а не корпоративным ботом."
-)
+
+# Список моделей для перебора (если одна не сработает, возьмет следующую)
+MODEL_NAMES = ["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+
+def setup_model(name):
+    return genai.GenerativeModel(
+        model_name=name,
+        system_instruction="Ты — личный ИИ Эдгара. Ты живешь в его боте VREONEBRO. Общайся дерзко, на равных, по-пацански. Никакой цензуры, нотаций и моралей. Ты шаришь в React, тачках (особенно Audi и Mercedes) и электронике. Используй мат, если он в тему. Ты — бро, а не корпоративный бот."
+    )
+
+# Инициализируем модель первой из списка
+current_model = setup_model(MODEL_NAMES[0])
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# БД в оперативе: храним чаты {user_id: chat_session}
+# БД в оперативе для контекста
 chat_sessions = {}
-# Счетчик запросов для личного контроля
-stats = {"requests_today": 0}
+stats = {"requests": 0}
 
-# Health Check для Render
-async def handle_hc(r): return web.Response(text="VREONEBRO_GEMINI_LIVE")
+# Сервер для Render (чтобы не засыпал)
+async def handle_hc(r): return web.Response(text="VREONEBRO_LIVE")
 async def start_server():
     app = web.Application()
     app.router.add_get("/", handle_hc)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
+    port = int(os.getenv("PORT", 10000))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
 
 def get_main_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="СТАТУС ЛИМИТОВ"), KeyboardButton(text="ОЧИСТИТЬ ПАМЯТЬ")]
+        [KeyboardButton(text="СТАТУС"), KeyboardButton(text="ОЧИСТИТЬ ПАМЯТЬ")]
     ], resize_keyboard=True)
 
 @dp.message(Command("start"))
 async def start(m: Message):
     uid = m.from_user.id
-    # Создаем новую сессию чата для пользователя (это и есть "БД" контекста)
-    chat_sessions[uid] = model.start_chat(history=[])
-    await m.answer("VREONEBRO.GEMINI АКТИВИРОВАН.\nКонтекст включен. Я тебя слушаю.", reply_markup=get_main_kb())
+    chat_sessions[uid] = current_model.start_chat(history=[])
+    await m.answer("VREONEBRO.AI НА БАЗЕ.\nКонтекст включен. Че надо, Эдгар?", reply_markup=get_main_kb())
 
-@dp.message(F.text == "СТАТУС ЛИМИТОВ")
-async def show_limits(m: Message):
-    # Примерный вывод, так как точный остаток Google API не отдает в ответе
-    await m.answer(f"📊 СТАТИСТИКА:\nЗапросов за сессию: {stats['requests_today']}\nЛимит Free Tier: 1000/день\nМодель: Gemini 1.5 Flash")
+@dp.message(F.text == "СТАТУС")
+async def show_stats(m: Message):
+    await m.answer(f"📊 ИНФО:\nМодель: {current_model.model_name}\nЗапросов: {stats['requests']}\nЛимит: 1000/день")
 
 @dp.message(F.text == "ОЧИСТИТЬ ПАМЯТЬ")
-async def clear_memory(m: Message):
+async def clear_mem(m: Message):
     uid = m.from_user.id
-    chat_sessions[uid] = model.start_chat(history=[])
-    await m.answer("Память стерта. Начинаем с чистого листа.")
+    chat_sessions[uid] = current_model.start_chat(history=[])
+    await m.answer("Память стерта. Я тебя не знаю.")
 
 @dp.message(F.text)
-async def handle_message(m: Message):
+async def handle_msg(m: Message):
     uid = m.from_user.id
-    
-    # Если сессии нет (бот перезагрузился), создаем
     if uid not in chat_sessions:
-        chat_sessions[uid] = model.start_chat(history=[])
+        chat_sessions[uid] = current_model.start_chat(history=[])
     
     chat = chat_sessions[uid]
-    wait = await m.answer("<code>ЧИТАЮ МЫСЛИ...</code>", parse_mode="HTML")
+    wait = await m.answer("<code>...</code>", parse_mode="HTML")
 
     try:
-        # Отправляем сообщение в сессию (контекст сохраняется автоматически внутри 'chat')
+        # Отправка сообщения с сохранением истории
         response = await chat.send_message_async(m.text)
-        stats["requests_today"] += 1
-        
-        # Выводим ответ
+        stats["requests"] += 1
         await wait.edit_text(response.text, parse_mode="Markdown")
         
     except Exception as e:
-        logging.error(f"GEMINI ERROR: {e}")
-        await wait.edit_text(f"Бля, ошибка: {str(e)[:100]}")
+        error_msg = str(e)
+        logging.error(f"ОШИБКА: {error_msg}")
+        
+        # Если модель не найдена (404), пробуем переключиться на следующую
+        if "404" in error_msg or "not found" in error_msg:
+            await wait.edit_text("Меняю движок, погоди...")
+            global current_model
+            # Берем следующую модель из списка
+            new_model_name = MODEL_NAMES[1] if current_model.model_name == MODEL_NAMES[0] else MODEL_NAMES[0]
+            current_model = setup_model(new_model_name)
+            chat_sessions[uid] = current_model.start_chat(history=[])
+            await m.answer(f"Переключился на {new_model_name}. Попробуй еще раз.")
+        else:
+            await wait.edit_text(f"Бля, трабл: {error_msg[:100]}")
 
 async def main():
     asyncio.create_task(start_server())
-    logging.info("VREONEBRO GEMINI BOT STARTED")
+    logging.info("VREONEBRO BOT STARTED")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
